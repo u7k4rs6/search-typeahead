@@ -8,7 +8,7 @@ interface TrieNode {
   isEnd: boolean;
   query: string;   // full query string, set when isEnd=true
   count: number;   // raw search count, set when isEnd=true
-  topK: Suggestion[]; // cached top-10 completions for this prefix
+  topK: Suggestion[]; // cached top-100 completions for this prefix
 }
 
 export class Trie {
@@ -33,7 +33,7 @@ export class Trie {
   }
 
   // Post-order traversal to compute topK for every node.
-  // Each node's topK = top-10 of: {self if isEnd} + {all children's topK lists}.
+  // Each node's topK = top-100 of: {self if isEnd} + {all children's topK lists}.
   // Children are refreshed before parents, so their topK is ready for merging.
   private computeTopKAll(node: TrieNode): void {
     for (const child of node.children.values()) {
@@ -53,7 +53,10 @@ export class Trie {
       }
     }
     candidates.sort((a, b) => b.count - a.count);
-    node.topK = candidates.slice(0, 10);
+    // Store top-100 so enhanced mode can re-rank a wider pool: recall vs. cost
+    // trade-off — 100 entries covers surging queries outside the all-time top-10;
+    // cost is ~10x more memory per node, which is acceptable for an in-process store.
+    node.topK = candidates.slice(0, 100);
   }
 
   // Build the trie from a bulk list and compute all topK in one pass.
