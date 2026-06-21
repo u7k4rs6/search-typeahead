@@ -13,6 +13,12 @@ function fnv1a32(str: string): number {
     h ^= str.charCodeAt(i);
     h = Math.imul(h, 16777619) >>> 0;
   }
+  // MurmurHash3 fmix32 finalizer — fixes FNV-1a's weak avalanche on near-identical labels
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35) >>> 0;
+  h ^= h >>> 16;
   return h >>> 0;
 }
 
