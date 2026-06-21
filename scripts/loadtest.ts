@@ -28,19 +28,35 @@ function pickQuery(): string {
   return COLD[Math.floor(Math.random() * COLD.length)];
 }
 
+function pct(arr: number[], p: number): number {
+  const sorted = arr.slice().sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
+}
+
+// Per-operation counters and client-side latency samples.
+let suggestCount = 0;
+let searchCount = 0;
+const clientLatencies: number[] = [];
+
 async function doSuggest(query: string): Promise<void> {
   // Use a realistic prefix (60% of the query length, min 2 chars).
   const len = Math.max(2, Math.ceil(query.length * 0.6));
   const prefix = query.slice(0, len);
+  const t0 = performance.now();
   await fetch(`${BASE}/api/suggest?q=${encodeURIComponent(prefix)}&mode=basic`);
+  clientLatencies.push(performance.now() - t0);
+  suggestCount++;
 }
 
 async function doSearch(query: string): Promise<void> {
+  const t0 = performance.now();
   await fetch(`${BASE}/api/search`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query }),
   });
+  clientLatencies.push(performance.now() - t0);
+  searchCount++;
 }
 
 async function request(i: number): Promise<void> {
@@ -74,15 +90,28 @@ async function main(): Promise<void> {
   const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
   console.log(`\nDone: ${TOTAL} requests in ${elapsed}s  (${(TOTAL / parseFloat(elapsed)).toFixed(0)} req/s)\n`);
 
-  // ── Final metrics snapshot ───────────────────────────────────────────────────
+  // ── Operation breakdown ──────────────────────────────────────────────────────
+  console.log('=== operation breakdown ===');
+  console.log(`  suggest (GET /api/suggest): ${suggestCount}`);
+  console.log(`  search  (POST /api/search): ${searchCount}`);
+  console.log(`  total                     : ${suggestCount + searchCount}`);
+  console.log('');
+
+  // ── Client-side latency (end-to-end round-trip including network + serialize) ──
+  console.log('=== client-side latency (end-to-end round-trip) ===');
+  console.log(`  p50: ${pct(clientLatencies, 50).toFixed(2)} ms`);
+  console.log(`  p95: ${pct(clientLatencies, 95).toFixed(2)} ms`);
+  console.log(`  p99: ${pct(clientLatencies, 99).toFixed(2)} ms`);
+  console.log('');
+
+  // ── Server-side metrics snapshot ─────────────────────────────────────────────
   const m = await fetch(`${BASE}/api/metrics`).then((r) => r.json() as any);
 
-  console.log('=== /api/metrics snapshot ===');
-  console.log(`  p50 latency:     ${(+m.latency.p50Ms).toFixed(3)} ms`);
-  console.log(`  p95 latency:     ${(+m.latency.p95Ms).toFixed(3)} ms`);
-  console.log(`  p99 latency:     ${(+m.latency.p99Ms).toFixed(3)} ms`);
-  console.log(`  mean latency:    ${(+m.latency.meanMs).toFixed(3)} ms`);
-  console.log(`  latency samples: ${m.latency.samples}`);
+  console.log('=== server-side latency (suggest handler compute only) ===');
+  console.log(`  p50: ${(+m.latency.p50Ms).toFixed(3)} ms`);
+  console.log(`  p95: ${(+m.latency.p95Ms).toFixed(3)} ms`);
+  console.log(`  p99: ${(+m.latency.p99Ms).toFixed(3)} ms`);
+  console.log(`  mean: ${(+m.latency.meanMs).toFixed(3)} ms   samples: ${m.latency.samples}`);
   console.log('');
   console.log(`  cache hit rate:  ${m.cache.hitRate}%`);
   console.log(`  cache hits:      ${m.cache.totalHits}`);
@@ -93,8 +122,8 @@ async function main(): Promise<void> {
   console.log(`  wb flush cycles: ${m.writeBuffer.flushCount}`);
   if (m.writeBuffer.totalEnqueued > 0) {
     const saved = m.writeBuffer.totalEnqueued - m.writeBuffer.totalFlushed;
-    const pct = ((saved / m.writeBuffer.totalEnqueued) * 100).toFixed(1);
-    console.log(`  write reduction: ${pct}%  (${saved} duplicate writes avoided)`);
+    const ratio = ((saved / m.writeBuffer.totalEnqueued) * 100).toFixed(1);
+    console.log(`  write reduction: ${ratio}%  (${saved} duplicate writes avoided)`);
   }
   console.log('');
   console.log('  ring key distribution (cache keys per physical node):');

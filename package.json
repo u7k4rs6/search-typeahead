@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "loadtest": "node scripts/loadtest.ts"
+    "loadtest": "node scripts/loadtest.ts",
+    "ringdist": "node scripts/ringdist.ts"
   },
   "dependencies": {
     "next": "14.2.5",
