@@ -13,8 +13,6 @@ export interface TypeaheadSystem {
   buffer: WriteBuffer;
   metrics: MetricsCollector;
   ring: ConsistentHashRing;
-  mode: 'basic' | 'enhanced';
-  setMode: (m: 'basic' | 'enhanced') => void;
   config: {
     nNodes: number;
     vnodes: number;
@@ -25,90 +23,65 @@ export interface TypeaheadSystem {
   };
 }
 
-// Config knobs — change these to see effect on write-reduction and cache behavior.
+// Tuneable knobs — changing these changes the demo numbers.
 const CONFIG = {
   nNodes: 5,
   vnodes: 150,
-  cacheTtlMs: 30_000,    // 30 seconds
-  batchSize: 50,
-  flushIntervalMs: 5_000, // 5 seconds
-  halfLifeMs: 3_600_000,  // 1 hour trending half-life
+  cacheTtlMs: 30_000,     // 30 s
+  batchSize: 50,           // size-trigger: flush when this many unique queries are buffered
+  flushIntervalMs: 5_000,  // time-trigger: flush at least every 5 s
+  halfLifeMs: 3_600_000,   // trending half-life: 1 hour
 };
 
 function buildSystem(): TypeaheadSystem {
-  console.log('[System] Initializing...');
+  console.log('[System] Initializing…');
   const t0 = Date.now();
 
-  // 1. Generate and ingest dataset
-  const dataset = generateDataset();
-
-  // 2. Build primary store
+  // 1. Dataset → primary store (trie + count map)
   const store = new PrimaryStore();
-  store.build(dataset);
+  store.build(generateDataset());
 
-  // 3. Consistent-hash ring over N logical cache nodes
+  // 2. Consistent-hash ring over N logical in-process cache nodes
   const nodeIds = Array.from({ length: CONFIG.nNodes }, (_, i) => `node-${i}`);
   const ring = new ConsistentHashRing(nodeIds, CONFIG.vnodes);
-  console.log('[System] Ring distribution:', ring.getVnodeDistribution());
+  console.log('[System] Ring vnode distribution:', ring.getVnodeDistribution());
 
-  // 4. Distributed cache (in-process nodes, routed by the ring)
+  // 3. Distributed cache (prefix → owning node, ring-routed)
   const cache = new DistributedCache(ring, CONFIG.cacheTtlMs);
 
-  // 5. Trending manager
+  // 4. Trending manager (exponential-decay scores per query)
   const trending = new TrendingManager(CONFIG.halfLifeMs);
 
-  // 6. Metrics
+  // 5. Metrics collector (latency samples → percentiles)
   const metrics = new MetricsCollector();
 
-  // 7. Write buffer with flush callback
+  // 6. Write buffer: enqueues are synchronous, flushes are background
   const buffer = new WriteBuffer({
     batchSize: CONFIG.batchSize,
     flushIntervalMs: CONFIG.flushIntervalMs,
-    onFlush: (batch) => {
-      // Apply count updates to the primary store
+    onFlush(batch) {
+      // Apply to store (trie + map), update decay scores, evict stale cache entries
       const updated = store.applyBatch(batch);
-      // Update trending scores
-      for (const [query, delta] of batch) {
-        trending.update(query, delta);
-      }
-      // Invalidate cache entries for every prefix of every updated query
+      for (const [query, delta] of batch) trending.update(query, delta);
+      // Invalidate every prefix of every changed query
       for (const query of updated) {
-        for (let i = 1; i <= query.length; i++) {
-          cache.invalidate(query.slice(0, i));
-        }
+        for (let i = 1; i <= query.length; i++) cache.invalidate(query.slice(0, i));
       }
-      console.log(
-        `[Flush] ${updated.length} queries updated. Cache invalidated ${updated.reduce((s, q) => s + q.length, 0)} prefix entries.`
-      );
+      console.log(`[Flush] ${updated.length} queries → store. ${updated.reduce((s, q) => s + q.length, 0)} cache entries evicted.`);
     },
   });
 
-  console.log(`[System] Ready in ${Date.now() - t0}ms. ${store.queryCount} queries indexed.`);
-
-  let currentMode: 'basic' | 'enhanced' = 'basic';
-
-  return {
-    store,
-    cache,
-    trending,
-    buffer,
-    metrics,
-    ring,
-    get mode() { return currentMode; },
-    setMode(m) { currentMode = m; },
-    config: { ...CONFIG },
-  };
+  console.log(`[System] Ready in ${Date.now() - t0} ms — ${store.queryCount.toLocaleString()} queries indexed.`);
+  return { store, cache, trending, buffer, metrics, ring, config: { ...CONFIG } };
 }
 
-// Singleton: persists across Next.js hot reloads in development via global.
+// Persist the instance on globalThis so Next.js hot-reload does not re-ingest the dataset.
 declare global {
   // eslint-disable-next-line no-var
   var __typeaheadSystem: TypeaheadSystem | undefined;
 }
 
 export function getSystem(): TypeaheadSystem {
-  if (!global.__typeaheadSystem) {
-    global.__typeaheadSystem = buildSystem();
-  }
+  if (!global.__typeaheadSystem) global.__typeaheadSystem = buildSystem();
   return global.__typeaheadSystem;
 }

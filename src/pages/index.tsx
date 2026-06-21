@@ -1,366 +1,379 @@
 import { useState, useEffect, useRef, useCallback, KeyboardEvent } from 'react';
 import Head from 'next/head';
 
+// ── Types matching the API response shapes ────────────────────────────────────
 interface Suggestion { query: string; count: number; }
-interface SuggestResponse {
-  suggestions: Suggestion[];
-  source: 'cache' | 'trie' | 'empty';
-  node?: string;
-  latencyMs?: number;
-  mode: string;
-}
-interface TrendingItem { query: string; count: number; score: number | null; }
-interface DebugResult { prefix: string; node: string; status: 'hit' | 'miss'; message: string; }
-interface MetricsData {
-  latency: { p50Ms: number; p95Ms: number; meanMs: number; samples: number };
-  cache: { hitRate: number; totalHits: number; totalMisses: number };
-  writeBuffer: { pendingQueries: number; totalEnqueued: number; flushCount: number };
+interface DebugInfo   { source: string; node: string; latencyMs: number; }
+interface TrendItem   { query: string; count: number; }
+interface Metrics {
+  latency:     { p50Ms: number; p95Ms: number; p99Ms: number; meanMs: number; samples: number };
+  cache:       { hitRate: number; totalHits: number; totalMisses: number };
+  writeBuffer: { pendingQueries: number; totalEnqueued: number; totalFlushed: number; flushCount: number };
 }
 
-const DEBOUNCE_MS = 250;
+const DEBOUNCE_MS = 150;
 
 export default function Home() {
-  const [query, setQuery] = useState('');
+  // ── Search state ────────────────────────────────────────────────────────────
+  const [query,       setQuery]       = useState('');
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
-  const [selectedIdx, setSelectedIdx] = useState(-1);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [searchMsg, setSearchMsg] = useState<string | null>(null);
-  const [lastSource, setLastSource] = useState<{ src: string; node: string; ms?: number } | null>(null);
+  const [highlighted, setHighlighted] = useState(-1);    // dropdown keyboard cursor
+  const [dropOpen,    setDropOpen]    = useState(false);
+  const [sugLoading,  setSugLoading]  = useState(false);
+  const [sugError,    setSugError]    = useState<string | null>(null);
+  const [lastDebug,   setLastDebug]   = useState<DebugInfo | null>(null);
+
+  // ── Search-submission state ──────────────────────────────────────────────────
+  const [searchMsg,   setSearchMsg]   = useState<string | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
+
+  // ── Mode (only affects /api/suggest; trending is always enhanced) ───────────
   const [mode, setMode] = useState<'basic' | 'enhanced'>('basic');
-  const [trending, setTrending] = useState<TrendingItem[]>([]);
+
+  // ── Trending state ──────────────────────────────────────────────────────────
+  const [trending,        setTrending]        = useState<TrendItem[]>([]);
   const [trendingLoading, setTrendingLoading] = useState(false);
-  const [debugPrefix, setDebugPrefix] = useState('');
-  const [debugResult, setDebugResult] = useState<DebugResult | null>(null);
-  const [metrics, setMetrics] = useState<MetricsData | null>(null);
-  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [trendingError,   setTrendingError]   = useState<string | null>(null);
 
-  const inputRef = useRef<HTMLInputElement>(null);
+  // ── Metrics state ───────────────────────────────────────────────────────────
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
+
+  // ── Refs ────────────────────────────────────────────────────────────────────
+  const inputRef   = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const abortRef   = useRef<AbortController | null>(null); // cancel in-flight suggest requests
 
-  // ── Fetch suggestions (debounced) ─────────────────────────────────────────
-  const fetchSuggestions = useCallback(
-    async (q: string, activeMode: string) => {
-      if (!q.trim()) { setSuggestions([]); setDropdownOpen(false); return; }
-      setIsLoading(true);
-      setError(null);
-      try {
-        const res = await fetch(`/api/suggest?q=${encodeURIComponent(q)}&mode=${activeMode}`);
-        const data: SuggestResponse = await res.json();
-        setSuggestions(data.suggestions);
-        setLastSource({ src: data.source, node: data.node ?? '', ms: data.latencyMs });
-        setDropdownOpen(data.suggestions.length > 0);
-      } catch {
-        setError('Suggestion fetch failed');
-      } finally {
-        setIsLoading(false);
-      }
-    },
-    []
-  );
+  // ── Fetch suggestions ────────────────────────────────────────────────────────
+  const fetchSuggestions = useCallback(async (q: string, m: string) => {
+    // Cancel the previous in-flight request before starting a new one.
+    if (abortRef.current) abortRef.current.abort();
+    abortRef.current = new AbortController();
 
-  const scheduleSearch = useCallback(
-    (q: string, m: string) => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      debounceRef.current = setTimeout(() => fetchSuggestions(q, m), DEBOUNCE_MS);
-    },
-    [fetchSuggestions]
-  );
+    if (!q.trim()) { setSuggestions([]); setDropOpen(false); setSugLoading(false); return; }
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = e.target.value;
-    setQuery(val);
-    setSelectedIdx(-1);
-    scheduleSearch(val, mode);
+    setSugLoading(true);
+    setSugError(null);
+    try {
+      const res  = await fetch(
+        `/api/suggest?q=${encodeURIComponent(q)}&mode=${m}`,
+        { signal: abortRef.current.signal },
+      );
+      const data = await res.json();
+      setSuggestions(data.suggestions ?? []);
+      setLastDebug(data._debug ?? null);
+      setDropOpen((data.suggestions ?? []).length > 0);
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') setSugError('Could not load suggestions');
+    } finally {
+      setSugLoading(false);
+    }
+  }, []);
+
+  // Debounced wrapper — cancels the pending timeout on every keystroke.
+  const scheduleSearch = useCallback((q: string, m: string) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => fetchSuggestions(q, m), DEBOUNCE_MS);
+  }, [fetchSuggestions]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = e.target.value;
+    setQuery(v);
+    setHighlighted(-1);
+    scheduleSearch(v, mode);
   };
 
-  // ── Submit search ─────────────────────────────────────────────────────────
+  // ── Submit a search ──────────────────────────────────────────────────────────
   const submitSearch = useCallback(async (q: string) => {
     const term = q.trim();
     if (!term) return;
-    setDropdownOpen(false);
+    setDropOpen(false);
     setSuggestions([]);
+    setSearchMsg(null);
+    setSearchError(null);
     try {
-      const res = await fetch('/api/search', {
+      const res  = await fetch('/api/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: term }),
       });
       const data = await res.json();
-      setSearchMsg(`Searched for "${data.query}" — ${data.message}`);
-      setTimeout(() => setSearchMsg(null), 4000);
-      // Refresh trending after submitting
-      fetchTrending(mode);
+      setSearchMsg(data.message ?? 'Searched');
+      setTimeout(() => setSearchMsg(null), 3500);
+      fetchTrending();
     } catch {
-      setSearchMsg('Search failed');
+      setSearchError('Search failed — please try again');
     }
-  }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Keyboard nav ──────────────────────────────────────────────────────────
+  // ── Keyboard navigation ──────────────────────────────────────────────────────
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (!dropdownOpen || suggestions.length === 0) {
+    if (e.key === 'Escape') { setDropOpen(false); setHighlighted(-1); return; }
+    if (!dropOpen || suggestions.length === 0) {
       if (e.key === 'Enter') submitSearch(query);
       return;
     }
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setSelectedIdx((i) => Math.min(i + 1, suggestions.length - 1));
+      setHighlighted(i => Math.min(i + 1, suggestions.length - 1));
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      setSelectedIdx((i) => Math.max(i - 1, -1));
+      setHighlighted(i => Math.max(i - 1, -1));
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (selectedIdx >= 0) {
-        const sel = suggestions[selectedIdx].query;
+      if (highlighted >= 0) {
+        const sel = suggestions[highlighted].query;
         setQuery(sel);
-        setDropdownOpen(false);
+        setDropOpen(false);
         setSuggestions([]);
         submitSearch(sel);
       } else {
         submitSearch(query);
       }
-    } else if (e.key === 'Escape') {
-      setDropdownOpen(false);
-      setSelectedIdx(-1);
     }
   };
 
-  const selectSuggestion = (s: Suggestion) => {
+  const pickSuggestion = (s: Suggestion) => {
     setQuery(s.query);
-    setDropdownOpen(false);
+    setDropOpen(false);
     setSuggestions([]);
     submitSearch(s.query);
     inputRef.current?.focus();
   };
 
-  // ── Mode toggle ───────────────────────────────────────────────────────────
-  const switchMode = async (m: 'basic' | 'enhanced') => {
+  // ── Mode toggle (only affects /api/suggest ranking) ──────────────────────────
+  const switchMode = (m: 'basic' | 'enhanced') => {
     setMode(m);
-    await fetch('/api/trending', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: m }),
-    });
-    fetchTrending(m);
     if (query.trim()) scheduleSearch(query, m);
   };
 
-  // ── Fetch trending ────────────────────────────────────────────────────────
-  const fetchTrending = useCallback(async (m: string) => {
+  // ── Fetch trending (always enhanced/recency-aware) ───────────────────────────
+  const fetchTrending = useCallback(async () => {
     setTrendingLoading(true);
+    setTrendingError(null);
     try {
-      const res = await fetch(`/api/trending?mode=${m}`);
+      const res  = await fetch('/api/trending?n=10');
       const data = await res.json();
       setTrending(data.trending ?? []);
-    } catch { /* ignore */ }
-    finally { setTrendingLoading(false); }
+    } catch {
+      setTrendingError('Could not load trending');
+    } finally {
+      setTrendingLoading(false);
+    }
   }, []);
 
-  // ── Fetch cache debug ─────────────────────────────────────────────────────
-  const fetchDebug = async () => {
-    if (!debugPrefix.trim()) return;
-    try {
-      const res = await fetch(`/api/cache/debug?prefix=${encodeURIComponent(debugPrefix.trim().toLowerCase())}`);
-      const data = await res.json();
-      setDebugResult(data);
-    } catch { /* ignore */ }
-  };
-
-  // ── Fetch metrics ─────────────────────────────────────────────────────────
+  // ── Fetch metrics ────────────────────────────────────────────────────────────
   const fetchMetrics = useCallback(async () => {
     try {
-      const res = await fetch('/api/metrics');
+      const res  = await fetch('/api/metrics');
       const data = await res.json();
       setMetrics(data);
-    } catch { /* ignore */ }
+    } catch { /* non-critical, silently skip */ }
   }, []);
 
+  // ── On mount: load trending + metrics; poll metrics every 5 s ────────────────
   useEffect(() => {
-    fetchTrending(mode);
+    fetchTrending();
     fetchMetrics();
-    const interval = setInterval(() => { fetchMetrics(); }, 5000);
-    return () => clearInterval(interval);
+    const id = setInterval(fetchMetrics, 5_000);
+    return () => clearInterval(id);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Click outside to close dropdown ──────────────────────────────────────
+  // ── Close dropdown on outside click ──────────────────────────────────────────
   useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (!target.closest('.search-wrapper')) setDropdownOpen(false);
+    const handle = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest('.search-wrap')) setDropOpen(false);
     };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
+    document.addEventListener('mousedown', handle);
+    return () => document.removeEventListener('mousedown', handle);
   }, []);
 
+  // ── Render ───────────────────────────────────────────────────────────────────
   return (
     <>
       <Head>
-        <title>Search Typeahead System</title>
-        <meta name="description" content="Distributed search typeahead with consistent hashing" />
+        <title>Search Typeahead</title>
       </Head>
 
       <div className="app">
-        {/* ── Header ── */}
-        <div className="header">
+
+        {/* Header */}
+        <header className="header">
           <div>
-            <h1>Search Typeahead System</h1>
+            <h1>Search Typeahead</h1>
             <p>Trie · Consistent Hashing · Batch Writes · Trending</p>
           </div>
-          <div className="mode-toggle">
-            <button className={`mode-btn${mode === 'basic' ? ' active' : ''}`} onClick={() => switchMode('basic')}>
-              Basic
-            </button>
-            <button className={`mode-btn${mode === 'enhanced' ? ' active' : ''}`} onClick={() => switchMode('enhanced')}>
-              Enhanced
-            </button>
+          {/* Mode affects only /api/suggest ranking */}
+          <div className="mode-toggle" role="group" aria-label="Suggestion ranking mode">
+            <button className={`mode-btn${mode === 'basic'    ? ' active' : ''}`} onClick={() => switchMode('basic')}>Basic</button>
+            <button className={`mode-btn${mode === 'enhanced' ? ' active' : ''}`} onClick={() => switchMode('enhanced')}>Enhanced</button>
           </div>
-        </div>
+        </header>
 
-        {/* ── Search bar ── */}
-        <div className="search-wrapper">
-          <div className="search-input-row">
+        {/* Search input + dropdown */}
+        <div className="search-wrap">
+          <div className="search-row">
             <input
               ref={inputRef}
               className="search-input"
-              type="text"
-              placeholder="Type to search… (↑↓ to navigate, Enter to select)"
-              value={query}
-              onChange={handleInputChange}
-              onKeyDown={handleKeyDown}
+              type="search"
               autoComplete="off"
               spellCheck={false}
+              placeholder="Start typing… (↑↓ navigate, Enter select, Esc close)"
+              aria-label="Search"
+              aria-autocomplete="list"
+              aria-expanded={dropOpen}
+              value={query}
+              onChange={handleChange}
+              onKeyDown={handleKeyDown}
             />
-            <button className="search-btn" onClick={() => submitSearch(query)} disabled={!query.trim()}>
+            <button
+              className="search-btn"
+              onClick={() => submitSearch(query)}
+              disabled={!query.trim()}
+            >
               Search
             </button>
           </div>
 
-          {/* Dropdown */}
-          {dropdownOpen && suggestions.length > 0 && (
-            <div className="dropdown">
+          {/* Suggestion dropdown */}
+          {dropOpen && suggestions.length > 0 && (
+            <ul className="dropdown" role="listbox">
               {suggestions.map((s, i) => (
-                <div
+                <li
                   key={s.query}
-                  className={`dropdown-item${i === selectedIdx ? ' selected' : ''}`}
-                  onMouseDown={() => selectSuggestion(s)}
-                  onMouseEnter={() => setSelectedIdx(i)}
+                  role="option"
+                  aria-selected={i === highlighted}
+                  className={`drop-item${i === highlighted ? ' hi' : ''}`}
+                  onMouseDown={() => pickSuggestion(s)}
+                  onMouseEnter={() => setHighlighted(i)}
                 >
-                  <span className="query">{s.query}</span>
-                  <span className="count">{s.count.toLocaleString()} searches</span>
-                </div>
+                  <span className="drop-query">{s.query}</span>
+                  <span className="drop-count">{s.count.toLocaleString()}</span>
+                </li>
               ))}
-              {lastSource && (
-                <div className="dropdown-source">
-                  <span className={lastSource.src === 'cache' ? 'source-hit' : 'source-miss'}>
-                    {lastSource.src === 'cache' ? '● cache hit' : '● trie miss'}
+              {/* Cache hit/miss badge */}
+              {lastDebug && (
+                <li className="drop-meta" aria-hidden>
+                  <span className={lastDebug.source === 'cache' ? 'badge-hit' : 'badge-miss'}>
+                    {lastDebug.source === 'cache' ? '● cache hit' : '● trie miss'}
                   </span>
-                  {lastSource.node && <span>{lastSource.node}</span>}
-                  {lastSource.ms !== undefined && <span>{lastSource.ms}ms</span>}
-                </div>
+                  <span>{lastDebug.node}</span>
+                  <span>{lastDebug.latencyMs} ms</span>
+                </li>
               )}
-            </div>
+            </ul>
           )}
         </div>
 
-        {/* Status row */}
-        <div className="status-row">
-          {isLoading && (
-            <span className="status-msg loading"><span className="spinner" /> Fetching suggestions…</span>
-          )}
-          {error && <span className="status-msg error">{error}</span>}
-          {searchMsg && <span className="status-msg success">{searchMsg}</span>}
+        {/* Status line */}
+        <div className="status-line" aria-live="polite">
+          {sugLoading  && <span className="pill pill-loading"><span className="spin" />Loading…</span>}
+          {sugError    && <span className="pill pill-err">{sugError}</span>}
+          {searchMsg   && <span className="pill pill-ok">{searchMsg}</span>}
+          {searchError && <span className="pill pill-err">{searchError}</span>}
         </div>
 
-        {/* ── Main grid ── */}
-        <div className="main-grid">
-          {/* Trending */}
-          <div className="card">
-            <h3>Trending Searches · {mode === 'enhanced' ? 'Enhanced (decay)' : 'Basic (all-time)'}</h3>
-            {trendingLoading ? (
-              <p className="empty-msg"><span className="spinner" /></p>
-            ) : trending.length === 0 ? (
-              <p className="empty-msg">No trending data yet — search something!</p>
-            ) : (
-              <ul className="trending-list">
-                {trending.map((t, i) => (
+        {/* Main grid: trending | debug + metrics */}
+        <div className="grid">
+
+          {/* Trending panel (always enhanced/recency-aware) */}
+          <section className="card">
+            <h2 className="card-title">Trending · Recency-Aware</h2>
+            {trendingLoading && <p className="muted center"><span className="spin" /></p>}
+            {trendingError   && <p className="muted center">{trendingError}</p>}
+            {!trendingLoading && !trendingError && trending.length === 0 && (
+              <p className="muted center">No trending yet — search something!</p>
+            )}
+            {!trendingLoading && trending.length > 0 && (
+              <ol className="trend-list">
+                {trending.map((t) => (
                   <li
                     key={t.query}
-                    className="trending-item"
+                    className="trend-item"
                     onClick={() => { setQuery(t.query); scheduleSearch(t.query, mode); inputRef.current?.focus(); }}
                   >
-                    <span className="trending-rank">#{i + 1}</span>
-                    <span className="trending-query">{t.query}</span>
-                    <span className="trending-score">
-                      {t.score !== null
-                        ? `score ${t.score.toFixed(2)}`
-                        : `${t.count.toLocaleString()}`}
-                    </span>
+                    <span className="trend-query">{t.query}</span>
+                    <span className="trend-count">{t.count.toLocaleString()}</span>
                   </li>
                 ))}
-              </ul>
+              </ol>
             )}
-          </div>
+          </section>
 
-          {/* Cache debug */}
-          <div className="card">
-            <h3>Cache Debug · Consistent Hash Ring</h3>
-            <div className="debug-form">
-              <input
-                className="debug-input"
-                placeholder="prefix to inspect…"
-                value={debugPrefix}
-                onChange={(e) => setDebugPrefix(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') fetchDebug(); }}
-              />
-              <button className="debug-btn" onClick={fetchDebug}>Check</button>
-            </div>
-            {debugResult && (
-              <div className="debug-result">
-                <span className={debugResult.status}>{debugResult.status.toUpperCase()}</span>
-                {' · '}
-                <span>prefix: &quot;{debugResult.prefix}&quot;</span>
-                <div className="debug-node">Owned by: {debugResult.node}</div>
-              </div>
-            )}
-            {metrics && (
-              <div style={{ marginTop: '0.75rem', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                <div>Hit rate: <strong style={{ color: 'var(--green)' }}>{metrics.cache.hitRate}%</strong></div>
-                <div>Hits: {metrics.cache.totalHits} · Misses: {metrics.cache.totalMisses}</div>
-              </div>
-            )}
-          </div>
+          {/* Cache debug + metrics */}
+          <section className="card">
+            <h2 className="card-title">Cache · Consistent Hash Ring</h2>
+            <CacheDebug />
+            {metrics && <MetricsPanel m={metrics} />}
+          </section>
+
         </div>
-
-        {/* Metrics strip */}
-        {metrics && (
-          <div className="metrics-strip">
-            <div className="metric-chip">
-              <div className="label">p95 latency</div>
-              <div className="value">{metrics.latency.p95Ms.toFixed(2)}ms</div>
-            </div>
-            <div className="metric-chip">
-              <div className="label">p50 latency</div>
-              <div className="value">{metrics.latency.p50Ms.toFixed(2)}ms</div>
-            </div>
-            <div className="metric-chip">
-              <div className="label">cache hit rate</div>
-              <div className="value">{metrics.cache.hitRate}%</div>
-            </div>
-            <div className="metric-chip">
-              <div className="label">writes enqueued</div>
-              <div className="value">{metrics.writeBuffer.totalEnqueued}</div>
-            </div>
-            <div className="metric-chip">
-              <div className="label">flush cycles</div>
-              <div className="value">{metrics.writeBuffer.flushCount}</div>
-            </div>
-            <div className="metric-chip">
-              <div className="label">pending in buffer</div>
-              <div className="value">{metrics.writeBuffer.pendingQueries}</div>
-            </div>
-          </div>
-        )}
       </div>
     </>
+  );
+}
+
+// ── Sub-components (no business logic; only local UI state + one fetch each) ──
+
+function CacheDebug() {
+  const [prefix, setPrefix] = useState('');
+  const [result, setResult] = useState<{ node: string; status: 'hit' | 'miss' } | null>(null);
+  const [err,    setErr]    = useState<string | null>(null);
+
+  const check = async () => {
+    const p = prefix.trim().toLowerCase();
+    if (!p) return;
+    setErr(null);
+    try {
+      const res  = await fetch(`/api/cache/debug?prefix=${encodeURIComponent(p)}`);
+      const data = await res.json();
+      if (data.error) { setErr(data.error); setResult(null); } else setResult(data);
+    } catch { setErr('Request failed'); }
+  };
+
+  return (
+    <div className="debug-box">
+      <div className="debug-row">
+        <input
+          className="debug-input"
+          placeholder="prefix to inspect…"
+          value={prefix}
+          onChange={e => setPrefix(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') check(); }}
+        />
+        <button className="debug-btn" onClick={check}>Check</button>
+      </div>
+      {err    && <p className="muted">{err}</p>}
+      {result && (
+        <div className="debug-result">
+          <span className={result.status === 'hit' ? 'badge-hit' : 'badge-miss'}>
+            {result.status.toUpperCase()}
+          </span>
+          {' · '}
+          <span className="muted">{result.node}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MetricsPanel({ m }: { m: Metrics }) {
+  const chips = [
+    { label: 'p95 latency',    value: `${m.latency.p95Ms.toFixed(1)} ms` },
+    { label: 'p50 latency',    value: `${m.latency.p50Ms.toFixed(1)} ms` },
+    { label: 'cache hit rate', value: `${m.cache.hitRate} %` },
+    { label: 'writes queued',  value: m.writeBuffer.totalEnqueued.toLocaleString() },
+    { label: 'store writes',   value: m.writeBuffer.totalFlushed.toLocaleString() },
+    { label: 'flush cycles',   value: m.writeBuffer.flushCount.toLocaleString() },
+  ];
+  return (
+    <div className="metrics">
+      {chips.map(c => (
+        <div key={c.label} className="chip">
+          <div className="chip-label">{c.label}</div>
+          <div className="chip-value">{c.value}</div>
+        </div>
+      ))}
+    </div>
   );
 }

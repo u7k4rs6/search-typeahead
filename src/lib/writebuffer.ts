@@ -31,6 +31,9 @@ export class WriteBuffer {
   }
 
   flush(): void {
+    // Reschedule first so the interval keeps firing even when the buffer is empty.
+    // Without this, a timer-triggered flush on an empty buffer kills the timer.
+    this.rescheduleTimer();
     if (this.buffer.size === 0) return;
     const batch = new Map(this.buffer);
     this.buffer.clear();
@@ -41,7 +44,6 @@ export class WriteBuffer {
         `(${[...batch.values()].reduce((a, b) => a + b, 0)} total searches)`
     );
     this.config.onFlush(batch);
-    this.rescheduleTimer();
   }
 
   private scheduleTimer(): void {

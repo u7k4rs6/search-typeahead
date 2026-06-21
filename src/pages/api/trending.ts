@@ -1,41 +1,16 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { getSystem } from '@/lib/system';
 
+// GET /api/trending?n=10
+// Returns the top-n queries ranked by their current exponentially-decayed score.
+// This is always the recency-aware (enhanced) ranking — call /api/suggest for basic.
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (req.method === 'GET') {
-    const sys = getSystem();
-    const modeParam = req.query.mode as string | undefined;
-    const mode = modeParam === 'enhanced' ? 'enhanced' : modeParam === 'basic' ? 'basic' : sys.mode;
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
-    if (mode === 'enhanced') {
-      const top = sys.trending.getTopTrending(10);
-      return res.status(200).json({
-        mode,
-        trending: top.map((t) => ({
-          query: t.query,
-          score: Math.round(t.score * 100) / 100,
-          count: t.rawCount,
-        })),
-      });
-    } else {
-      // Basic mode: use all-time top suggestions for empty prefix
-      const top = sys.store.getSuggestions('', 10);
-      return res.status(200).json({
-        mode,
-        trending: top.map((t) => ({ query: t.query, count: t.count, score: null })),
-      });
-    }
-  }
+  const n = Math.min(50, Math.max(1, parseInt((req.query.n as string) ?? '10', 10) || 10));
+  const top = getSystem().trending.getTopTrending(n);
 
-  if (req.method === 'POST') {
-    // Allow changing the active mode
-    const { mode } = req.body ?? {};
-    if (mode !== 'basic' && mode !== 'enhanced') {
-      return res.status(400).json({ error: 'mode must be "basic" or "enhanced"' });
-    }
-    getSystem().setMode(mode);
-    return res.status(200).json({ mode });
-  }
-
-  return res.status(405).json({ error: 'Method not allowed' });
+  return res.status(200).json({
+    trending: top.map((t) => ({ query: t.query, count: t.rawCount })),
+  });
 }

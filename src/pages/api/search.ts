@@ -1,10 +1,11 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { getSystem } from '@/lib/system';
 
+// POST /api/search  body: { query: string }
+// Normalizes the query, enqueues it in the write buffer, and returns immediately.
+// The count update is asynchronous — no flush waits on this response.
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { query } = req.body ?? {};
   if (typeof query !== 'string' || !query.trim()) {
@@ -12,10 +13,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   const normalized = query.toLowerCase().trim();
-  const sys = getSystem();
+  getSystem().buffer.enqueue(normalized);
 
-  // Enqueue to write buffer — returns immediately, write is async.
-  sys.buffer.enqueue(normalized);
-
-  return res.status(200).json({ message: 'Searched', query: normalized });
+  return res.status(200).json({ message: 'Searched' });
 }
