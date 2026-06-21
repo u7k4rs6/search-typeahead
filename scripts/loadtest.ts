@@ -78,10 +78,10 @@ async function main(): Promise<void> {
   const m = await fetch(`${BASE}/api/metrics`).then((r) => r.json() as any);
 
   console.log('=== /api/metrics snapshot ===');
-  console.log(`  p50 latency:     ${m.latency.p50Ms} ms`);
-  console.log(`  p95 latency:     ${m.latency.p95Ms} ms`);
-  console.log(`  p99 latency:     ${m.latency.p99Ms} ms`);
-  console.log(`  mean latency:    ${m.latency.meanMs} ms`);
+  console.log(`  p50 latency:     ${(+m.latency.p50Ms).toFixed(3)} ms`);
+  console.log(`  p95 latency:     ${(+m.latency.p95Ms).toFixed(3)} ms`);
+  console.log(`  p99 latency:     ${(+m.latency.p99Ms).toFixed(3)} ms`);
+  console.log(`  mean latency:    ${(+m.latency.meanMs).toFixed(3)} ms`);
   console.log(`  latency samples: ${m.latency.samples}`);
   console.log('');
   console.log(`  cache hit rate:  ${m.cache.hitRate}%`);
@@ -97,9 +97,9 @@ async function main(): Promise<void> {
     console.log(`  write reduction: ${pct}%  (${saved} duplicate writes avoided)`);
   }
   console.log('');
-  console.log('  ring vnode distribution:');
-  for (const [node, count] of Object.entries(m.ring.vnodeDistribution)) {
-    console.log(`    ${node}: ${count} vnodes`);
+  console.log('  ring key distribution (cache keys per physical node):');
+  for (const [node, count] of Object.entries(m.ring.keyDistribution)) {
+    console.log(`    ${node}: ${count} keys`);
   }
 }
 

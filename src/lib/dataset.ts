@@ -1,5 +1,5 @@
 // Programmatic dataset: generates 100k+ realistic search queries with
-// deterministic counts so the server always starts with the same data.
+// Zipf-distributed counts so popularity mirrors real search traffic.
 
 const BRANDS = [
   'apple','samsung','google','amazon','sony','microsoft','nike','adidas','netflix','spotify',
@@ -72,19 +72,14 @@ const VERBS = [
   'use','learn','master','improve','optimize','speed up','troubleshoot','debug','test','deploy',
 ];
 
-// Deterministic pseudo-random count based on query content (Zipf-like distribution).
-function deterministicCount(query: string): number {
+// FNV-1a 32-bit hash — used to assign a deterministic random rank to each query.
+function fnv1a32(str: string): number {
   let h = 2166136261;
-  for (let i = 0; i < query.length; i++) {
-    h ^= query.charCodeAt(i);
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
     h = Math.imul(h, 16777619) >>> 0;
   }
-  const bucket = h % 1000;
-  if (bucket < 10)  return 5000 + (h % 5000);  // top 1%: 5000-10000
-  if (bucket < 50)  return 1000 + (h % 4000);  // next 4%: 1000-5000
-  if (bucket < 200) return 100  + (h % 900);   // next 15%: 100-1000
-  if (bucket < 500) return 10   + (h % 90);    // next 30%: 10-100
-  return 1 + (h % 9);                           // bottom 50%: 1-9
+  return h >>> 0;
 }
 
 export interface QueryEntry {
@@ -94,13 +89,14 @@ export interface QueryEntry {
 
 export function generateDataset(): QueryEntry[] {
   const seen = new Set<string>();
-  const entries: QueryEntry[] = [];
+  // Pass 1: collect unique query strings (no counts yet).
+  const queries: string[] = [];
 
   const add = (q: string) => {
     const norm = q.toLowerCase().trim().replace(/\s+/g, ' ');
     if (!norm || seen.has(norm)) return;
     seen.add(norm);
-    entries.push({ query: norm, count: deterministicCount(norm) });
+    queries.push(norm);
   };
 
   // Specific real-world product names with high counts
@@ -291,6 +287,20 @@ export function generateDataset(): QueryEntry[] {
       }
     }
   }
+
+  // Pass 2: assign true Zipf(α=0.9) counts.
+  // Sort queries by their FNV hash to get a deterministic, uniformly-spread ranking,
+  // then apply count(rank) = round(10000 / rank^0.9).
+  // α=0.9 matches observed real search traffic: top query is ~10 000× more popular
+  // than the median; ~92% of queries get count=1 (long tail), which is realistic.
+  const sorted = queries.slice().sort((a, b) => fnv1a32(a) - fnv1a32(b));
+  const rankOf = new Map<string, number>();
+  sorted.forEach((q, i) => rankOf.set(q, i + 1));
+
+  const entries: QueryEntry[] = queries.map((q) => ({
+    query: q,
+    count: Math.max(1, Math.round(10_000 / Math.pow(rankOf.get(q)!, 0.9))),
+  }));
 
   console.log(`[Dataset] Generated ${entries.length} unique queries`);
   return entries;

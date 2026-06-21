@@ -10,13 +10,14 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   const sys = getSystem();
-  const t0 = Date.now();
+  // performance.now() has sub-ms fractional resolution; Date.now() floors to 1 ms.
+  const t0 = performance.now();
 
   const prefix = ((req.query.q as string) ?? '').toLowerCase().trim();
   const mode = (req.query.mode as string) === 'enhanced' ? 'enhanced' : 'basic';
 
   if (!prefix) {
-    sys.metrics.recordLatency(Date.now() - t0);
+    sys.metrics.recordLatency(performance.now() - t0);
     return res.status(200).json({ suggestions: [] });
   }
 
@@ -27,7 +28,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (mode === 'enhanced') {
     const candidates = sys.store.getSuggestions(prefix, 100);
     const suggestions = sys.trending.rerank(candidates).slice(0, 10);
-    const latencyMs = Date.now() - t0;
+    const latencyMs = performance.now() - t0;
     sys.metrics.recordLatency(latencyMs);
     return res.status(200).json({
       suggestions,
@@ -38,17 +39,18 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   // Basic: cache-first (ring-routed); trie on miss, then repopulate cache.
   const cached = sys.cache.get(prefix);
   if (cached !== null) {
-    sys.metrics.recordLatency(Date.now() - t0);
+    const latencyMs = performance.now() - t0;
+    sys.metrics.recordLatency(latencyMs);
     return res.status(200).json({
       suggestions: cached,
-      _debug: { source: 'cache', node: sys.ring.getNode(prefix), latencyMs: Date.now() - t0 },
+      _debug: { source: 'cache', node: sys.ring.getNode(prefix), latencyMs },
     });
   }
 
   const suggestions = sys.store.getSuggestions(prefix, 10);
   sys.cache.set(prefix, suggestions);
 
-  const latencyMs = Date.now() - t0;
+  const latencyMs = performance.now() - t0;
   sys.metrics.recordLatency(latencyMs);
 
   return res.status(200).json({

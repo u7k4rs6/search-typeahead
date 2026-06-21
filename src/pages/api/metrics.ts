@@ -7,7 +7,7 @@ import { getSystem } from '@/lib/system';
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { metrics, cache, buffer, store, ring } = getSystem();
+  const { metrics, cache, buffer, store } = getSystem();
 
   return res.status(200).json({
     // Latency distribution over the last 10 k /suggest calls
@@ -23,11 +23,12 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       hitRate: Math.round(cache.hitRate * 10000) / 100, // percent, 2 dp
       totalHits: cache.stats.totalHits,
       totalMisses: cache.stats.totalMisses,
-      perNodeKeyCount: cache.stats.perNodeKeyCount,
     },
     // Write-reduction: totalEnqueued (raw searches) vs totalFlushed (unique store writes)
     writeBuffer: buffer.stats,
     store: { queryCount: store.queryCount },
-    ring: { vnodeDistribution: ring.getVnodeDistribution() },
+    // Per-node key count: how many cache keys each physical node currently owns.
+    // Shows load distribution under real traffic (vnodeDistribution is a static config fact).
+    ring: { keyDistribution: cache.stats.perNodeKeyCount },
   });
 }
